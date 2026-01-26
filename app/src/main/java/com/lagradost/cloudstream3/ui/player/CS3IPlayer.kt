@@ -15,6 +15,7 @@ import android.widget.FrameLayout
 import androidx.annotation.MainThread
 import androidx.annotation.OptIn
 import androidx.appcompat.app.AlertDialog
+import androidx.core.net.toUri
 import androidx.media3.common.C.TIME_UNSET
 import androidx.media3.common.C.TRACK_TYPE_AUDIO
 import androidx.media3.common.C.TRACK_TYPE_TEXT
@@ -54,8 +55,8 @@ import androidx.media3.exoplayer.source.ClippingMediaSource
 import androidx.media3.exoplayer.source.ConcatenatingMediaSource
 import androidx.media3.exoplayer.source.ConcatenatingMediaSource2
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.SingleSampleMediaSource
 import androidx.media3.exoplayer.text.TextOutput
 import androidx.media3.exoplayer.text.TextRenderer
@@ -65,6 +66,7 @@ import androidx.media3.extractor.mp4.FragmentedMp4Extractor
 import androidx.media3.ui.SubtitleView
 import androidx.preference.PreferenceManager
 import com.lagradost.cloudstream3.APIHolder.getApiFromNameNull
+import com.lagradost.cloudstream3.AudioFile
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.setKey
 import com.lagradost.cloudstream3.CommonActivity.activity
@@ -73,32 +75,33 @@ import com.lagradost.cloudstream3.MainActivity.Companion.deleteFileOnExit
 import com.lagradost.cloudstream3.R
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.USER_AGENT
-import com.lagradost.cloudstream3.AudioFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.mvvm.debugAssert
 import com.lagradost.cloudstream3.mvvm.logError
 import com.lagradost.cloudstream3.mvvm.safe
 import com.lagradost.cloudstream3.ui.player.CustomDecoder.Companion.fixSubtitleAlignment
-import com.lagradost.cloudstream3.ui.settings.Globals.TV
+import com.lagradost.cloudstream3.ui.settings.Globals.EMULATOR
+import com.lagradost.cloudstream3.ui.settings.Globals.PHONE
 import com.lagradost.cloudstream3.ui.settings.Globals.isLayout
 import com.lagradost.cloudstream3.ui.subtitles.SaveCaptionStyle
 import com.lagradost.cloudstream3.ui.subtitles.SubtitlesFragment.Companion.applyStyle
 import com.lagradost.cloudstream3.utils.AppContextUtils.isUsingMobileData
 import com.lagradost.cloudstream3.utils.AppContextUtils.setDefaultFocus
+import com.lagradost.cloudstream3.utils.CLEARKEY_UUID
 import com.lagradost.cloudstream3.utils.Coroutines.ioSafe
 import com.lagradost.cloudstream3.utils.Coroutines.runOnMainThread
 import com.lagradost.cloudstream3.utils.DataStoreHelper.currentAccount
 import com.lagradost.cloudstream3.utils.DrmExtractorLink
 import com.lagradost.cloudstream3.utils.EpisodeSkip
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.CLEARKEY_UUID
-import com.lagradost.cloudstream3.utils.WIDEVINE_UUID
-import com.lagradost.cloudstream3.utils.PLAYREADY_UUID
 import com.lagradost.cloudstream3.utils.ExtractorLinkPlayList
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.PLAYREADY_UUID
 import com.lagradost.cloudstream3.utils.SubtitleHelper.fromTagToLanguageName
+import com.lagradost.cloudstream3.utils.WIDEVINE_UUID
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
 import kotlinx.coroutines.delay
+import okhttp3.Interceptor
 import org.chromium.net.CronetEngine
 import java.io.File
 import java.util.UUID
@@ -106,10 +109,6 @@ import java.util.concurrent.Executors
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSession
-import kotlin.collections.HashSet
-import kotlin.text.StringBuilder
-import androidx.core.net.toUri
-import okhttp3.Interceptor
 
 const val TAG = "CS3ExoPlayer"
 const val PREFERRED_AUDIO_LANGUAGE_KEY = "preferred_audio_language"
@@ -742,13 +741,23 @@ class CS3IPlayer : IPlayer {
         private var simpleCache: SimpleCache? = null
 
         /// Create a small factory for small things, no cache, no cronet
-        private fun createOnlineSource(headers: Map<String, String>?): HttpDataSource.Factory {
-            val source = OkHttpDataSource.Factory(app.baseClient).setUserAgent(USER_AGENT)
-            return source.apply {
-                if (!headers.isNullOrEmpty()) {
-                    setDefaultRequestProperties(headers)
-                }
+        private fun createOnlineSource(
+            headers: Map<String, String>?,
+            interceptor: Interceptor?
+        ): HttpDataSource.Factory {
+            val client = if (interceptor == null) {
+                app.baseClient
+            } else {
+                app.baseClient.newBuilder()
+                    .addInterceptor(interceptor)
+                    .build()
             }
+            val source = OkHttpDataSource.Factory(client).setUserAgent(USER_AGENT)
+
+            if (!headers.isNullOrEmpty()) {
+                source.setDefaultRequestProperties(headers)
+            }
+            return source
         }
 
         fun tryCreateEngine(context: Context, diskCacheSize: Long): CronetEngine? {
@@ -787,10 +796,9 @@ class CS3IPlayer : IPlayer {
 
         private fun createVideoSource(
             link: ExtractorLink,
-            engine: CronetEngine?
+            engine: CronetEngine?,
+            interceptor: Interceptor?,
         ): HttpDataSource.Factory {
-            val provider = getApiFromNameNull(link.source)
-            val interceptor: Interceptor? = provider?.getVideoInterceptor(link)
             val userAgent = link.headers.entries.find {
                 it.key.equals("User-Agent", ignoreCase = true)
             }?.value ?: USER_AGENT
@@ -1079,22 +1087,27 @@ class CS3IPlayer : IPlayer {
                         context.getString(R.string.software_decoding_key),
                         -1
                     )
-                    val softwareDecoding = when (current) {
-                        0 -> true // yes
-                        1 -> false // no
+                    val (isSoftwareDecodingEnabled, isSoftwareDecodingPreferred) = when (current) {
+                        0 -> true to false // HW+SW, aka on but prefer hw
+                        2 -> true to true // SW+HW, aka on but prefer sw
+                        1 -> false to false // HW, aka off
                         // -1 = automatic
-                        else -> {
-                            // we do not want tv to have software decoding, because of crashes
-                            !isLayout(TV)
-                        }
+                        // We do not want tv to have software decoding, because of crashes
+                        else -> isLayout(PHONE or EMULATOR) to false
                     }
 
-                    val factory = if (softwareDecoding) {
+                    val factory = if (isSoftwareDecodingEnabled) {
                         NextRenderersFactory(context).apply {
                             setEnableDecoderFallback(true)
-                            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+                            setExtensionRendererMode(
+                                if (isSoftwareDecodingPreferred)
+                                    DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
+                                else
+                                    DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON
+                            )
                         }
                     } else {
+                        // no nextlib = EXTENSION_RENDERER_MODE_OFF
                         DefaultRenderersFactory(context)
                     }
 
@@ -1635,7 +1648,8 @@ class CS3IPlayer : IPlayer {
 
             val (subSources, activeSubtitles) = getSubSources(
                 offlineSourceFactory = offlineSourceFactory,
-                subtitleHelper,
+                subHelper = subtitleHelper,
+                interceptor = null,
             )
 
             subtitleHelper.setActiveSubtitles(activeSubtitles.toSet())
@@ -1649,6 +1663,7 @@ class CS3IPlayer : IPlayer {
     private fun getSubSources(
         offlineSourceFactory: DataSource.Factory?,
         subHelper: PlayerSubtitleHelper,
+        interceptor: Interceptor?,
     ): Pair<List<SingleSampleMediaSource>, List<SubtitleData>> {
         val activeSubtitles = ArrayList<SubtitleData>()
         val subSources = subHelper.getAllSubtitles().mapNotNull { sub ->
@@ -1670,8 +1685,9 @@ class CS3IPlayer : IPlayer {
                 }
 
                 SubtitleOrigin.URL -> {
+                    val dataSourceFactory = createOnlineSource(sub.headers, interceptor)
                     activeSubtitles.add(sub)
-                    SingleSampleMediaSource.Factory(createOnlineSource(sub.headers))
+                    SingleSampleMediaSource.Factory(dataSourceFactory)
                         .createMediaSource(subConfig, TIME_UNSET)
                 }
             }
@@ -1686,14 +1702,13 @@ class CS3IPlayer : IPlayer {
      */
     private fun getAudioSources(
         audioTracks: List<AudioFile>,
+        interceptor: Interceptor?,
     ): List<MediaSource> {
-        if (audioTracks.isEmpty()) return emptyList()
         return audioTracks.mapNotNull { audio ->
             try {
                 val mediaItem = getMediaItem(MimeTypes.AUDIO_UNKNOWN, audio.url)
-                DefaultMediaSourceFactory(createOnlineSource(audio.headers)).createMediaSource(
-                    mediaItem
-                )
+                val dataSourceFactory = createOnlineSource(audio.headers, interceptor)
+                DefaultMediaSourceFactory(dataSourceFactory).createMediaSource(mediaItem)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to create audio source for ${audio.url}: ${e.message}")
                 null
@@ -1865,19 +1880,28 @@ class CS3IPlayer : IPlayer {
                 )
             }
 
+            val provider = getApiFromNameNull(link.source)
+            val interceptor: Interceptor? = provider?.getVideoInterceptor(link)
+
             val onlineSourceFactory =
-                createVideoSource(link, tryCreateEngine(context, simpleCacheSize))
+                createVideoSource(
+                    link = link,
+                    engine = tryCreateEngine(context, simpleCacheSize),
+                    interceptor = interceptor
+                )
 
             val offlineSourceFactory = context.createOfflineSource()
 
             val (subSources, activeSubtitles) = getSubSources(
                 offlineSourceFactory = offlineSourceFactory,
-                subtitleHelper
+                subHelper = subtitleHelper,
+                interceptor = interceptor, // Backwards compatibility, needs a new api to work properly
             )
 
             // Create audio sources from ExtractorLink's audioTracks
             val audioSources = getAudioSources(
                 audioTracks = link.audioTracks,
+                interceptor = interceptor, // Backwards compatibility, needs a new api to work properly
             )
 
             subtitleHelper.setActiveSubtitles(activeSubtitles.toSet())
